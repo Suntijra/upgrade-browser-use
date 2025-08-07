@@ -1,56 +1,59 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from langchain.llms import Ollama
-from langchain.agents import initialize_agent, AgentType
-from langchain.tools import Tool
-from playwright.sync_api import sync_playwright
+import argparse
+import os
+import requests
+from bs4 import BeautifulSoup
 
-# ─── เตรียม Playwright ────────────────────────────────────────────────────
-play = sync_playwright().start()
-browser = play.chromium.launch(headless=True)
-page = browser.new_page()
 
-def navigate_to(url: str) -> str:
-    page.goto(url)
-    return f"Navigated to {url}"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 
-def click_element(selector: str) -> str:
-    page.click(selector)
-    return f"Clicked element {selector}"
 
-tools = [
-    Tool(name="navigate_to", func=navigate_to, description="Navigate to the given URL"),
-    Tool(name="click_element", func=click_element, description="Click a page element by CSS selector"),
-]
+def fetch_text(url: str) -> str:
+    """ดึงข้อมูลจากเว็บไซต์และคืนค่าเป็นข้อความรวม"""
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    return " ".join(s.strip() for s in soup.stripped_strings)
 
-# ─── สร้าง LLM + Agent ────────────────────────────────────────────────────
-llm = Ollama(
-    model="your-model-name",           # เปลี่ยนเป็นชื่อโมเดลของคุณ
-    base_url="http://localhost:11434",
-    verbose=False,
-)
 
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-    verbose=False,
-)
+def build_prompt(article: str, team: str) -> str:
+    """สร้างพรอมต์สำหรับให้ LLM เขียนสคริปต์วิดีโอ"""
+    return (
+        f"วิเคราะห์ข้อมูลต่อไปนี้และเขียนสคริปต์วิดีโอภาษาไทยเกี่ยวกับทีม {team} "
+        "ความยาวประมาณ 700-800 คำ ประกอบด้วย: เกริ่นนำ, ประเด็นสำคัญ, สรุปตอนท้าย.\n\n"
+        f"ข้อมูลบทความ:\n{article}"
+    )
 
-# ─── สร้าง FastAPI App ───────────────────────────────────────────────────
-app = FastAPI()
 
-class PromptRequest(BaseModel):
-    prompt: str
+def generate_with_ollama(prompt: str) -> str:
+    """เรียก Ollama API เพื่อสร้างสคริปต์"""
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+    resp = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response", "").strip()
 
-@app.post("/run-agent")
-async def run_agent(req: PromptRequest):
+
+def main() -> None:
+    """สคริปต์บรรทัดคำสั่งสำหรับสร้างสคริปต์วิดีโอ"""
+    parser = argparse.ArgumentParser(
+        description="Generate a 5-minute football video script from an article URL"
+    )
+    parser.add_argument("url", help="URL ของบทความ")
+    parser.add_argument("team", help="ชื่อทีมฟุตบอล")
+    args = parser.parse_args()
+
     try:
-        result = agent.run(req.prompt)
-        return {"result": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        article_text = fetch_text(args.url)
+        if len(article_text) > 8000:
+            article_text = article_text[:8000]
+        prompt = build_prompt(article_text, args.team)
+        script = generate_with_ollama(prompt)
+        print(script)
+    except Exception as exc:
+        raise SystemExit(f"เกิดข้อผิดพลาด: {exc}")
 
-# ─── รันด้วย Uvicorn ─────────────────────────────────────────────────────
-# ใช้คำสั่งด้านล่างจากเทอร์มินัลเพื่อติดตั้งเซิร์ฟเวอร์
-# uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+if __name__ == "__main__":
+    main()
+
